@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fora-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The only required binding. Workers AI is called through this, so the Worker
+  // needs no Cloudflare API token at runtime.
+  "ai": {
+    "binding": "AI"
+  },
+
+  // No R2 bucket on purpose. Images are returned inline as base64 and cached at
+  // the edge, which removes the "bucket does not exist" class of deploy failure
+  // and keeps first-time setup to a single command.
+
+  "observability": {
+    "enabled": true
+  },
+
+  "vars": {
+    // Comma-separated origins allowed to call this Worker from a browser.
+    // Leave empty for "*". Example: "https://lordmannu993.github.io"
+    "ALLOWED_ORIGINS": ""
+  }
+
+  // Secrets — set with `wrangler secret put <NAME>`, never in this file:
+  //   JEV_API_KEY    Jev AI key, so the browser never carries it.
+  //   API_KEYS       Optional comma-separated bearer tokens to lock the Worker.
+  //   CF_ACCOUNT_ID  Optional, only for the REST fallback path.
+  //   CF_AI_TOKEN    Optional, only for the REST fallback path.
+}
