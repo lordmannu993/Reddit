@@ -14,6 +14,8 @@ import { communities as builtinCommunities } from '../data';
 import type { CommunityProfile, ContextSource, CultureProfile, Post, SortOption } from '../types';
 import { analyseSnapshot } from './cultureAnalysis';
 import { estimatedProfile, profileFromCommunity } from './offlineProfiles';
+import { curateBatch, loadJevSettings } from './jevClient';
+import { loadImageSettings } from './imageEngine';
 import { generateWithModel, loadModelSettings, modelIsConfigured } from './llmClient';
 import {
   ContextUnavailableError,
@@ -463,6 +465,10 @@ export interface BatchResult {
   usedModel: boolean;
   modelError?: string;
   source: ContextSource;
+  /** True when Jev ranked the candidates and picked this page. */
+  curated?: boolean;
+  /** Why curation was skipped, when it was. */
+  curationNote?: string;
 }
 
 function safePosts(posts: Post[]): Post[] {
@@ -475,6 +481,14 @@ function safePosts(posts: Post[]): Post[] {
 }
 
 /** Generate the next slice of an endless feed for one community. */
+/**
+ * How many extra candidates to synthesise so the decision layer has a choice.
+ * Jev only ranks what it is given, so a page of 6 is chosen from 9.
+ */
+function candidateCount(keep: number, curating: boolean): number {
+  return curating ? Math.min(keep * 2, keep + 4) : keep;
+}
+
 export async function generateBatch(
   community: CommunityProfile,
   options: { count?: number; batch?: number; profile?: CultureProfile } = {},
@@ -485,6 +499,27 @@ export async function generateBatch(
   const count = options.count ?? 6;
   const profile = options.profile || getContextSync(community);
   const settings = loadModelSettings();
+  const jev = loadJevSettings();
+  const imageSettings = loadImageSettings();
+  const proxyBase = imageSettings.workerUrl.trim();
+  const curating = jev.enabled;
+  const wanted = candidateCount(count, curating);
+
+  /** Rank candidates with Jev, then keep the best `count`. Never throws. */
+  const choose = async (candidates: Post[], usedModel: boolean, modelError?: string): Promise<BatchResult> => {
+    if (!curating || candidates.length <= count) {
+      return { posts: candidates.slice(0, count), usedModel, modelError, source: profile.source };
+    }
+    const result = await curateBatch(candidates, profile, count, { proxyBase, settings: jev });
+    return {
+      posts: result.posts,
+      usedModel,
+      modelError,
+      source: profile.source,
+      curated: result.used,
+      curationNote: result.note,
+    };
+  };
 
   if (modelIsConfigured(settings)) {
     try {
@@ -493,7 +528,7 @@ export async function generateBatch(
         profile,
         community,
         batch,
-        count,
+        count: wanted,
         avoidTitles: Array.from(ledger.titles),
       });
       const safe = safePosts(posts).filter(post => {
@@ -502,22 +537,17 @@ export async function generateBatch(
         ledger.titles.add(key);
         return true;
       });
-      if (safe.length) return { posts: safe, usedModel: true, source: profile.source };
+      if (safe.length) return await choose(safe, true);
     } catch (error) {
       const posts = safePosts(synthesizePosts({
         profile,
         community,
         batch,
-        count,
+        count: wanted,
         usedTitles: ledger.titles,
         usedSignatures: ledger.signatures,
       }));
-      return {
-        posts,
-        usedModel: false,
-        modelError: error instanceof Error ? error.message : 'Model request failed',
-        source: profile.source,
-      };
+      return await choose(posts, false, error instanceof Error ? error.message : 'Model request failed');
     }
   }
 
@@ -525,11 +555,11 @@ export async function generateBatch(
     profile,
     community,
     batch,
-    count,
+    count: wanted,
     usedTitles: ledger.titles,
     usedSignatures: ledger.signatures,
   }));
-  return { posts, usedModel: false, source: profile.source };
+  return await choose(posts, false);
 }
 
 /** Generate a blended batch across every community the user follows. */

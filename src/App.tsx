@@ -13,6 +13,14 @@ import {
 } from './services/simulation';
 import { ContextUnavailableError, getCustomProxy, looksLikeSubreddit, normalizeSubredditName, searchSubreddits, setCustomProxy, type SubredditSuggestion } from './services/redditContext';
 import { DEFAULT_MODELS, loadModelSettings, modelIsConfigured, saveModelSettings } from './services/llmClient';
+import {
+  defaultImageSettings, generateImage, imageStats, imagesConfigured, loadImageSettings,
+  saveImageSettings, testImageWorker, type ImageSettings,
+} from './services/imageEngine';
+import {
+  defaultJevSettings, jevStatus, loadJevSettings, saveJevSettings, testJev, type JevSettings,
+} from './services/jevClient';
+import { FLUX_MODELS } from './config/providers';
 import type { Comment, CommunityProfile, CultureProfile, ModelProvider, ModelSettings, Page, Post, SortOption, VoteState } from './types';
 import './styles.css';
 
@@ -125,14 +133,66 @@ function ContextBadge({ profile, refreshing }: { profile?: CultureProfile; refre
   return <span className="context-badge offline"><WifiOff size={12} /> Estimated profile</span>;
 }
 
-function ConceptCard({ post }: { post: Post }) {
+/**
+ * An image post's picture.
+ *
+ * Generation is deliberately lazy: the request only fires once the card is
+ * actually on screen, so scrolling past fifty posts does not queue fifty FLUX
+ * calls. Without a Worker configured this falls back to the described concept,
+ * which is what the site has always shown.
+ */
+function ConceptCard({ post, profile }: { post: Post; profile?: CultureProfile }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [state, setState] = useState<'idle' | 'loading' | 'done' | 'off'>('idle');
+  const holder = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const settings = loadImageSettings();
+    if (!imagesConfigured(settings) || !post.concept) { setState('off'); return; }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const run = () => {
+      if (cancelled) return;
+      setState('loading');
+      generateImage(post, { settings, profile, signal: controller.signal })
+        .then(url => {
+          if (cancelled) return;
+          setSrc(url);
+          setState(url ? 'done' : 'off');
+        })
+        .catch(() => { if (!cancelled) setState('off'); });
+    };
+
+    const node = holder.current;
+    if (!node || typeof IntersectionObserver === 'undefined') { run(); return () => { cancelled = true; controller.abort(); }; }
+
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); run(); }
+    }, { rootMargin: '300px' });
+    observer.observe(node);
+
+    return () => { cancelled = true; controller.abort(); observer.disconnect(); };
+  }, [post.id, profile]);
+
   if (!post.concept) return null;
+
   return (
-    <figure className="concept-card">
+    <figure className="concept-card" ref={holder as React.RefObject<HTMLElement>}>
+      {src && (
+        <div className="concept-image-wrap">
+          <img className="concept-image" src={src} alt={post.concept.altText || post.title} loading="lazy" />
+          <span className="image-badge"><Wand2 size={13} /> AI image · FLUX.2</span>
+        </div>
+      )}
+      {state === 'loading' && <div className="concept-image-skeleton"><LoaderCircle size={18} className="spin" /> drawing this concept…</div>}
       <figcaption className="concept-head"><ImageIcon size={14} /> {post.concept.format}</figcaption>
       <p className="concept-setup">{post.concept.setup}</p>
       {post.concept.punchline && <p className="concept-punch">{post.concept.punchline}</p>}
-      <span className="concept-note">Described image concept — no image was generated</span>
+      <span className="concept-note">
+        {src ? 'Generated illustration — not a real photograph' : 'Described image concept — no image was generated'}
+      </span>
     </figure>
   );
 }
@@ -373,6 +433,27 @@ function PostCard({
       </div>
     </article>
   );
+}
+
+/**
+ * Append a freshly generated page.
+ *
+ * Deduplicates on id *and* on normalised title: two concurrent scroll loads can
+ * race and produce distinct ids for the same headline, and an infinite feed
+ * that repeats itself is the one thing it must never do.
+ */
+function appendUnique(current: Post[], incoming: Post[]): Post[] {
+  const ids = new Set(current.map(post => post.id));
+  const titles = new Set(current.map(post => post.title.toLowerCase().replace(/\s+/g, ' ').trim()));
+  const fresh: Post[] = [];
+  for (const post of incoming) {
+    const key = post.title.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (ids.has(post.id) || titles.has(key)) continue;
+    ids.add(post.id);
+    titles.add(key);
+    fresh.push(post);
+  }
+  return fresh.length ? [...current, ...fresh] : current;
 }
 
 function PostSkeleton() {
@@ -1068,6 +1149,11 @@ function SettingsPage({ theme, setTheme, notify, onClearCache }: {
   const [model, setModel] = useState<ModelSettings>(() => loadModelSettings());
   const [proxy, setProxy] = useState(() => getCustomProxy());
   const [prefs, setPrefs] = useState({ autoRefresh: true, compact: false });
+  const [images, setImages] = useState<ImageSettings>(() => loadImageSettings());
+  const [jev, setJev] = useState<JevSettings>(() => loadJevSettings());
+  const [workerTest, setWorkerTest] = useState<{ ok: boolean; detail: string } | null>(null);
+  const [jevTest, setJevTest] = useState<{ ok: boolean; detail: string } | null>(null);
+  const [testing, setTesting] = useState<'' | 'worker' | 'jev'>('');
   const flip = (key: keyof typeof prefs) => setPrefs(value => ({ ...value, [key]: !value[key] }));
 
   const update = (patch: Partial<ModelSettings>) => {
@@ -1091,7 +1177,12 @@ function SettingsPage({ theme, setTheme, notify, onClearCache }: {
 
       <section className="settings-section">
         <h2>Generation engine</h2>
-        <p className="settings-copy">The built-in engine runs entirely on this device and needs no key. Add your own model key for richer writing — it is stored only in this browser and called directly from it.</p>
+        <p className="settings-copy">
+          The built-in engine runs entirely on this device and needs no key. Add your own Gemini, OpenAI or Anthropic key
+          for richer writing. Your key is written only to this browser's local storage, sent only to that provider's own
+          https endpoint as a request header — never in a URL, never to this site, never to the Worker, never to any
+          proxy — and it is stripped out of every error message. It is not in the repository and never will be.
+        </p>
         <label className="field-label">Provider</label>
         <div className="provider-row">
           {(['none', 'openai', 'gemini', 'anthropic', 'custom'] as ModelProvider[]).map(provider => (
@@ -1112,10 +1203,89 @@ function SettingsPage({ theme, setTheme, notify, onClearCache }: {
                 <input className="text-input" value={model.baseUrl} onChange={event => update({ baseUrl: event.target.value })} placeholder="https://your-gateway/v1" />
               </>
             )}
-            <div className="settings-warning"><TriangleAlert size={15} /> Browser-side keys are visible to anyone with access to this device. Use a restricted key.</div>
+            <div className="settings-warning"><TriangleAlert size={15} /> A key kept in a browser is readable by anyone who can use this device or its devtools. Prefer a restricted key with a spending cap, and revoke it if the device is shared.</div>
           </>
         )}
         <button className="primary-button" onClick={() => { saveModelSettings(model); notify(modelIsConfigured(model) ? 'Model connected' : 'Using the built-in engine'); }}>Save engine settings</button>
+      </section>
+
+      <section className="settings-section">
+        <h2>Pictures — FLUX.2 on Cloudflare</h2>
+        <p className="settings-copy">
+          Image posts can be drawn for real by FLUX.2 running on Cloudflare Workers AI. Deploy the Worker in
+          <code> worker/</code> (or your own <code>cloudflare-image-mcp</code>) and paste its URL here. Cloudflare
+          credentials stay in the Worker — this page never sees them. Pictures are generated only when a post scrolls
+          into view, and are capped per session so an endless feed cannot run up a bill.
+        </p>
+        <label className="toggle-row">
+          <span>Generate pictures for image posts</span>
+          <button className={`switch ${images.enabled ? 'on' : ''}`} onClick={() => setImages({ ...images, enabled: !images.enabled })} aria-pressed={images.enabled}><i /></button>
+        </label>
+        <label className="field-label">Worker base URL</label>
+        <input
+          className="text-input"
+          value={images.workerUrl}
+          onChange={event => { setImages({ ...images, workerUrl: event.target.value }); setWorkerTest(null); }}
+          placeholder="https://fora-edge.your-subdomain.workers.dev"
+        />
+        <label className="field-label">Model</label>
+        <div className="provider-row">
+          {FLUX_MODELS.map(option => (
+            <button key={option.id} className={images.model === option.id ? 'active' : ''} onClick={() => setImages({ ...images, model: option.id })}>
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <label className="field-label">Worker bearer token <span>optional — only if you set API_KEYS</span></label>
+        <input className="text-input" type="password" autoComplete="off" value={images.workerKey} onChange={event => setImages({ ...images, workerKey: event.target.value })} placeholder="leave blank for a public Worker" />
+        <label className="field-label">Images per session <span>{images.budget}</span></label>
+        <input type="range" min={0} max={200} step={5} value={images.budget} onChange={event => setImages({ ...images, budget: Number(event.target.value) })} />
+        {workerTest && <div className={`settings-result ${workerTest.ok ? 'ok' : 'bad'}`}>{workerTest.ok ? <Check size={15} /> : <TriangleAlert size={15} />} {workerTest.detail}</div>}
+        <div className="settings-actions">
+          <button className="primary-button" onClick={() => { saveImageSettings(images); notify(imagesConfigured(images) ? 'Picture generation on' : 'Pictures off — posts will show concepts'); }}>Save picture settings</button>
+          <button
+            className="ghost-button"
+            disabled={testing === 'worker'}
+            onClick={async () => { setTesting('worker'); setWorkerTest(await testImageWorker(images)); setTesting(''); }}
+          >
+            {testing === 'worker' ? <><LoaderCircle size={15} className="spin" /> Testing…</> : 'Test Worker'}
+          </button>
+        </div>
+        <div className="settings-note">Generated this session: {imageStats().spent} · cached: {imageStats().cached}</div>
+      </section>
+
+      <section className="settings-section">
+        <h2>Post curation — Jev</h2>
+        <p className="settings-copy">
+          Jev is a typed-decision model: it answers questions with a probability, a choice, or a score, and never writes
+          prose. So it does not write posts here — it judges them. Each page is over-generated and Jev ranks the
+          candidates on how well they fit what the community is talking about right now, how authentic they sound, and
+          whether they are generic filler. The best ones survive. If Jev is unreachable the feed is unaffected.
+        </p>
+        <label className="toggle-row">
+          <span>Let Jev pick which posts make the page</span>
+          <button className={`switch ${jev.enabled ? 'on' : ''}`} onClick={() => setJev({ ...jev, enabled: !jev.enabled })} aria-pressed={jev.enabled}><i /></button>
+        </label>
+        <label className="field-label">Strictness <span>{jev.strictness < 0.34 ? 'lenient' : jev.strictness < 0.67 ? 'balanced' : 'ruthless'}</span></label>
+        <input type="range" min={0} max={1} step={0.05} value={jev.strictness} onChange={event => setJev({ ...jev, strictness: Number(event.target.value) })} />
+        <label className="field-label">Jev key override <span>optional — a public project key is built in</span></label>
+        <input className="text-input" type="password" autoComplete="off" value={jev.apiKey} onChange={event => setJev({ ...jev, apiKey: event.target.value })} placeholder="jev_…" />
+        <div className="settings-note">
+          Jev asks for keys to stay server-side. When a Worker URL is set above, decisions are proxied through it and no
+          Jev key leaves this device. Without one, the browser calls Jev directly and may be blocked by CORS.
+        </div>
+        {jevTest && <div className={`settings-result ${jevTest.ok ? 'ok' : 'bad'}`}>{jevTest.ok ? <Check size={15} /> : <TriangleAlert size={15} />} {jevTest.detail}</div>}
+        <div className="settings-actions">
+          <button className="primary-button" onClick={() => { saveJevSettings(jev); notify(jev.enabled ? 'Jev curation on' : 'Jev curation off'); }}>Save curation settings</button>
+          <button
+            className="ghost-button"
+            disabled={testing === 'jev'}
+            onClick={async () => { setTesting('jev'); setJevTest(await testJev(images.workerUrl.trim(), jev.apiKey)); setTesting(''); }}
+          >
+            {testing === 'jev' ? <><LoaderCircle size={15} className="spin" /> Testing…</> : 'Test Jev'}
+          </button>
+        </div>
+        <div className="settings-note">Status: {jevStatus().status} · judged {jevStatus().judged} · dropped {jevStatus().dropped}</div>
       </section>
 
       <section className="settings-section">
@@ -1344,10 +1514,7 @@ function App() {
       communityBatch.current[community.id] = batch + 1;
       const profile = contexts[community.id] || getContextSync(community);
       const result = await generateBatch(community, { count: 6, batch, profile });
-      setAllPosts(current => {
-        const existing = new Set(current.map(post => post.id));
-        return [...current, ...result.posts.filter(post => !existing.has(post.id))];
-      });
+      setAllPosts(current => appendUnique(current, result.posts));
     } finally {
       setLoadingMore(false);
     }
@@ -1361,10 +1528,7 @@ function App() {
       const batch = homeBatch.current;
       homeBatch.current += 1;
       const posts = await generateHomeBatch(ids, batch, 6);
-      setAllPosts(current => {
-        const existing = new Set(current.map(post => post.id));
-        return [...current, ...posts.filter(post => !existing.has(post.id))];
-      });
+      setAllPosts(current => appendUnique(current, posts));
     } finally {
       setLoadingMore(false);
     }

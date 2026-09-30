@@ -131,14 +131,70 @@ function extractJson(text: string): unknown {
 }
 
 /* ------------------------------------------------------------------ */
+/* Key safety                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A model key lives in this browser and nowhere else. These guards exist so that a key
+ * cannot escape by accident:
+ *
+ *  - it is sent as a request header, never as a URL query parameter (URLs leak through
+ *    history, Referer, devtools and proxy logs);
+ *  - requests set `referrerPolicy: 'no-referrer'` so the page URL is not attached;
+ *  - a key is only ever sent to that provider's own origin, over https;
+ *  - error text is redacted before it can reach the UI, a log, or a bug report.
+ */
+const PROVIDER_ORIGINS: Record<string, string> = {
+  openai: 'https://api.openai.com',
+  gemini: 'https://generativelanguage.googleapis.com',
+  anthropic: 'https://api.anthropic.com',
+};
+
+/** Throws unless `url` is an https endpoint we are willing to hand this key to. */
+function assertKeyDestination(provider: string, url: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error('Endpoint is not a valid URL');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Refusing to send an API key over a non-https connection');
+  }
+  const expected = PROVIDER_ORIGINS[provider];
+  if (expected && parsed.origin !== expected) {
+    throw new Error(`Refusing to send the ${provider} key to ${parsed.origin}`);
+  }
+  if (parsed.search) {
+    throw new Error('Refusing to use an endpoint that carries a query string');
+  }
+}
+
+/** Removes anything key-shaped from a string before it is shown or logged. */
+export function redactSecrets(input: unknown, ...secrets: string[]): string {
+  let text = input instanceof Error ? input.message : String(input ?? '');
+  for (const secret of secrets) {
+    if (secret && secret.length > 6) text = text.split(secret).join('[redacted]');
+  }
+  return text
+    .replace(/\b(sk|sk-proj|sk-ant|gsk|jev)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]')
+    .replace(/\bAIza[A-Za-z0-9_-]{20,}/g, '[redacted]')
+    .replace(/([?&](?:key|api_key|apikey|access_token|token)=)[^&\s]+/gi, '$1[redacted]');
+}
+
+/* ------------------------------------------------------------------ */
 /* Providers                                                           */
 /* ------------------------------------------------------------------ */
 
 async function callOpenAiCompatible(settings: ModelSettings, prompt: string, signal?: AbortSignal): Promise<string> {
   const base = (settings.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
-  const response = await fetch(`${base}/chat/completions`, {
+  const endpoint = `${base}/chat/completions`;
+  // 'custom' is an explicit user-supplied gateway, so only the https rule applies to it.
+  assertKeyDestination(settings.provider === 'custom' ? 'custom' : 'openai', endpoint);
+  const response = await fetch(endpoint, {
     method: 'POST',
     signal,
+    referrerPolicy: 'no-referrer',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
     body: JSON.stringify({
       model: settings.model || DEFAULT_MODELS.openai,
@@ -157,11 +213,15 @@ async function callOpenAiCompatible(settings: ModelSettings, prompt: string, sig
 
 async function callGemini(settings: ModelSettings, prompt: string, signal?: AbortSignal): Promise<string> {
   const model = settings.model || DEFAULT_MODELS.gemini;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(settings.apiKey)}`;
+  // The key goes in a header, never the URL. A query-string key ends up in browser history,
+  // the Referer header, devtools, and any intermediary's access logs.
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  assertKeyDestination('gemini', url);
   const response = await fetch(url, {
     method: 'POST',
     signal,
-    headers: { 'Content-Type': 'application/json' },
+    referrerPolicy: 'no-referrer',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -174,9 +234,11 @@ async function callGemini(settings: ModelSettings, prompt: string, signal?: Abor
 }
 
 async function callAnthropic(settings: ModelSettings, prompt: string, signal?: AbortSignal): Promise<string> {
+  assertKeyDestination('anthropic', 'https://api.anthropic.com/v1/messages');
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     signal,
+    referrerPolicy: 'no-referrer',
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': settings.apiKey,

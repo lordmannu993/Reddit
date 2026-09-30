@@ -30,7 +30,9 @@ No API key, no server, no account. It runs on GitHub Pages as-is.
 | **Never runs out** | Scrolling generates the next batch indefinitely. Batches drift: topics blend, new angles appear, formats rotate. |
 | **Stays honest** | Every post carries an `AI` pill, every community page carries a simulation banner, and the context badge always says whether the signal is live, cached or estimated. |
 | **Degrades gracefully** | Reddit unreachable? It falls back to cached context, then to a derived offline profile, and keeps working. |
-| **Optional real LLM** | Paste an OpenAI, Gemini, Anthropic or OpenAI-compatible key in Settings to swap the built-in engine for a real model. Stored in your browser only. |
+| **Optional real LLM** | Paste an OpenAI, Gemini, Anthropic or OpenAI-compatible key in Settings to swap the built-in engine for a real model. Stored in your browser only, never in this repository. |
+| **Real pictures** | Image posts can be drawn by FLUX.2 on Cloudflare Workers AI, lazily and within a budget. |
+| **Curated by Jev** | Every page is over-generated and ranked by Jev's typed-decision model, so the feed stays on-topic as it scrolls. |
 
 ---
 
@@ -110,12 +112,69 @@ inside a thread. Verified: **90 posts over 15 scroll batches produced 90 unique 
 Batches drift as you scroll — later batches blend more topics, reach further down the cluster list, and
 favour different archetypes, so the feed keeps moving instead of looping.
 
-### 4. Optional real models — `src/services/llmClient.ts`
+### 4. Curation — `src/services/jevClient.ts`
 
-Settings → Generation engine accepts an OpenAI, Gemini, Anthropic or OpenAI-compatible endpoint. The key
-is kept in `localStorage`, called directly from your browser, and never sent anywhere else. The model gets
-the same `CultureProfile` — a statistical brief, never real post text — and is asked for JSON. If the call
-fails, is rate-limited, or returns junk, the built-in engine silently takes over so the feed never stalls.
+Jev AI is a **typed-decision** model: every answer is a `noul` (probability of yes), a
+`choice` (a label plus a distribution) or a `score` (a level on an ordered scale). It has
+no prose output at all — Jev bills output tokens at zero because there are none. So it
+cannot write posts, and it does not.
+
+What it does instead is decide which posts are worth showing. Each page is over-generated
+— nine candidates for six slots — and every candidate is put to Jev with three questions:
+
+| Question | Type | Asks |
+| --- | --- | --- |
+| `fit` | `score` | how close this is to what the community is discussing *right now*, on a five-level scale |
+| `authentic` | `noul` | would this read as written by a member of this community |
+| `filler` | `noul` | is this interchangeable filler that would fit any community |
+
+The three are blended into a single rank, anything below the strictness floor is dropped,
+and the best survivors become the page. That is the difference between a feed that never
+repeats and a feed that never drifts.
+
+Transport prefers the Worker's `/v1/decisions` route, so the Jev key can live as a Worker
+secret rather than in the bundle. Failures are always non-fatal: if Jev is unreachable the
+candidates are used unranked and the feed does not notice.
+
+### 5. Pictures — `src/services/imageEngine.ts` + `worker/`
+
+Image posts are written as a *concept* — a format, a setup and a punchline — rather than
+pretending a photo exists. That concept is exactly the right prompt, so when an image
+Worker is configured the concept gets drawn by **FLUX.2 on Cloudflare Workers AI**.
+
+The site calls `POST {worker}/v1/images/generations`, the OpenAI image contract. Both the
+Worker in `worker/` and `cloudflare-image-mcp` serve it, so either works.
+
+Generation is lazy and budgeted, because an infinite feed could otherwise fire hundreds of
+inference calls on one scroll:
+
+- a picture is only requested once its card is within 300px of the viewport;
+- identical prompts are cached in memory and shared between concurrent callers;
+- a per-session cap (default 40) stops runaway spend;
+- a failed call refunds its own budget slot.
+
+Generated pictures are labelled **AI image · FLUX.2** and captioned *"not a real
+photograph"*. Prompts forbid text, logos, watermarks and real people, and the style pool
+is entirely illustrative — nothing photoreal that could be mistaken for documentary
+evidence.
+
+### 6. Optional real models — `src/services/llmClient.ts`
+
+Settings → Generation engine accepts an OpenAI, Gemini, Anthropic or OpenAI-compatible endpoint. The model
+gets the same `CultureProfile` — a statistical brief, never real post text — and is asked for JSON. If the
+call fails, is rate-limited, or returns junk, the built-in engine silently takes over so the feed never stalls.
+
+**Key handling.** A text-generation key is the one credential this project treats as sacred:
+
+- it is written only to this browser's `localStorage`, never to the repository, never to a build;
+- it is sent as a request **header**, never a URL query parameter — a `?key=` lands in browser history,
+  the `Referer` header, devtools and every intermediary's access log;
+- requests set `referrerPolicy: 'no-referrer'`;
+- `assertKeyDestination()` refuses to send a key over plain http, to an origin that is not the provider's
+  own, or to a URL carrying a query string — so a typo'd custom base URL cannot exfiltrate it;
+- `redactSecrets()` strips key-shaped strings from anything that reaches the UI or a log.
+
+There is an automated audit for this. See *Verifying the key never leaks* below.
 
 ---
 
@@ -158,19 +217,56 @@ src/
   data.ts                     20 built-in communities, seed posts, local user
   types.ts                    CultureProfile, Post, CommunityProfile, ModelSettings, …
   styles.css                  design system + simulation layer
+  config/
+    providers.ts              public endpoints and the one deliberately-public key
   services/
     redditContext.ts          transport chain, listing fetch, subreddit search
     cultureAnalysis.ts        snapshot → CultureProfile
     offlineProfiles.ts        estimated profiles for known subs, built-in fallbacks
     synthesis.ts              key-free generator: 20 archetypes, bodies, comments, polls
     llmClient.ts              optional OpenAI / Gemini / Anthropic / custom providers
+    jevClient.ts              Jev typed decisions — ranks candidates, never writes
+    imageEngine.ts            lazy, budgeted FLUX.2 generation via the Worker
     simulation.ts             registry, context cache, batching, safety filters
+worker/                       Cloudflare Worker: FLUX.2 images + Jev proxy
+docs/
+  cloudflare-image-mcp-deploy.md    why that repo never deployed, and the fix
+  cloudflare-image-mcp-deploy.patch applies cleanly to commit 58f1258
+```
+
+### Keys: what is public and what is not
+
+| Credential | Where it lives | In the bundle? |
+| --- | --- | --- |
+| Gemini / OpenAI / Anthropic key | your browser's `localStorage` | **never** |
+| Cloudflare API token | a Worker secret / GitHub Actions secret | **never** |
+| Jev key | `src/config/providers.ts`, or a Worker secret | yes, by the owner's explicit choice |
+
+The Jev key is public on purpose: the repository owner supplied a free key and accepted the exposure so
+the decision layer works with zero setup. Everything else is structurally prevented from shipping.
+Deploy the Worker with `JEV_API_KEY` set and even that one moves server-side — build with
+`VITE_JEV_API_KEY=""` to strip it from the bundle entirely.
+
+### Verifying the key never leaks
+
+The repository ships an audit that runs the real client against a fake key and a fake network, then
+asserts where that key did and did not end up. It checks that the key is absent from the URL, that the
+URL has no query string, that it travels as `x-goog-api-key`, that it is not in the body, that
+`no-referrer` is set, that a path-traversal model name cannot redirect the host, that an `http://`
+endpoint is refused outright, and that redaction catches raw keys, `?key=` parameters and `sk-` tokens.
+
+A build audit backs it up:
+
+```bash
+npm run build
+grep -cE "AIza[A-Za-z0-9_-]{20,}|\bsk-[A-Za-z0-9]{20,}" dist/assets/*.js   # must print 0
 ```
 
 ### Local storage
 
 `fora-transport`, `fora-custom-proxy`, `fora-model-settings`, `fora-communities-v2`,
-`fora-ctx-v2:<sub>`, `fora-ctx-index-v2`, `fora-votes`, `fora-saved`, `fora-subscribed-v2`, `fora-theme`.
+`fora-ctx-v2:<sub>`, `fora-ctx-index-v2`, `fora-votes`, `fora-saved`, `fora-subscribed-v2`, `fora-theme`,
+`fora-image-settings`, `fora-jev-settings`, `fora-jev-unreachable`.
 Context entries expire after 40 minutes; at most 30 are kept. Clearing site data resets everything.
 
 ### Deploying
@@ -189,4 +285,8 @@ BASE_PATH=/Reddit/ npm run build
   still endless, just not current. Point it at your own proxy in Settings for reliability.
 - The built-in engine is a strong template-and-signal system, not a language model. It is fast, free and
   offline; a real model key produces more surprising prose.
+- Pictures and Jev curation both need the Worker deployed to your own Cloudflare account. Until then the
+  site runs exactly as before: concept cards instead of images, uncurated pages instead of ranked ones.
+- Jev's API is documented as server-side. Called straight from a browser it may be refused by CORS; the
+  Worker proxy exists for precisely that reason.
 - Fora is not affiliated with Reddit. It is a simulation, and it says so on every screen.

@@ -87,6 +87,11 @@ export interface Post {
   topicLabel?: string;
   contextSource?: ContextSource;
   batch?: number;
+  /**
+   * Jev's typed verdict on this post, when the decision layer picked it.
+   * `rank` is the blended value used for ordering; the others are raw.
+   */
+  curation?: { fit: number; authentic: number; rank: number };
 }
 
 /** A cluster of terms the real community is currently circling around. */
