@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [arena/01a0f181-reddit]
+    branches: [main, arena/01a0f181-reddit]
   workflow_dispatch:
 
 permissions:
