@@ -36,29 +36,53 @@ jobs:
         with:
           node-version: 20
 
+      # The Worker is optional: the site runs fine without it, showing concept
+      # cards instead of pictures. So a push with no Cloudflare secrets skips
+      # quietly rather than painting main red. A manual run fails loudly,
+      # because then you explicitly asked for a deploy.
       - name: Check required secrets
+        id: secrets
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          missing=0
-          if [ -z "$CF_TOKEN" ]; then echo "::error::CLOUDFLARE_API_TOKEN is not set"; missing=1; fi
-          if [ -z "$CF_ACCOUNT" ]; then echo "::error::CLOUDFLARE_ACCOUNT_ID is not set"; missing=1; fi
-          if [ "$missing" = "1" ]; then
-            echo "Add them under Settings -> Secrets and variables -> Actions."
+          if [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Required secrets present."
+            exit 0
+          fi
+
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          [ -z "$CF_TOKEN" ] && echo "CLOUDFLARE_API_TOKEN is not set"
+          [ -z "$CF_ACCOUNT" ] && echo "CLOUDFLARE_ACCOUNT_ID is not set"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::error::Add the secrets under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          echo "Required secrets present."
+
+          echo "::notice::Skipping Worker deploy - Cloudflare secrets are not configured. Pictures stay off until they are."
+          {
+            echo "## Edge Worker not deployed"
+            echo ""
+            echo "\`CLOUDFLARE_API_TOKEN\` and \`CLOUDFLARE_ACCOUNT_ID\` are not set, so this step was skipped."
+            echo "The site works without it — image posts show concept cards instead of pictures."
+            echo ""
+            echo "Add the secrets, then run this workflow manually to enable FLUX.2 images."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install
+        if: steps.secrets.outputs.ready == 'true'
         working-directory: worker
         run: npm install
 
       - name: Type check
+        if: steps.secrets.outputs.ready == 'true'
         working-directory: worker
         run: npm run check
 
       - name: Deploy
+        if: steps.secrets.outputs.ready == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -69,6 +93,7 @@ jobs:
       # Secrets are pushed after the first deploy, because `wrangler secret put`
       # requires the script to already exist.
       - name: Set Worker secrets
+        if: steps.secrets.outputs.ready == 'true'
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -90,7 +115,7 @@ jobs:
           printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | npx wrangler secret put DEPLOYED_AT
 
       - name: Summary
-        if: success()
+        if: success() && steps.secrets.outputs.ready == 'true'
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
